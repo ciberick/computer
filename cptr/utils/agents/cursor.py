@@ -83,7 +83,7 @@ async def run_cursor_agent(
         ]
         prompt_task = asyncio.create_task(client.prompt(prompt, images=images))
         try:
-            async for event in acp_event_stream(client):
+            async for event in acp_event_stream(client, until=prompt_task):
                 params = event.get("params") if isinstance(event.get("params"), dict) else {}
                 text = acp_text_from_update(params)
                 if text:

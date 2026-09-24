@@ -9,6 +9,11 @@ from contextlib import suppress
 from typing import Any, AsyncIterator
 
 
+# How long to wait for the next event before re-checking whether the turn has ended. Matches the
+# drain window the adapters already allow for a trailing event after the prompt resolves.
+ACP_IDLE_POLL_SECONDS = 0.25
+
+
 class AcpClient:
     def __init__(
         self,
@@ -410,6 +415,30 @@ def acp_models_from_setup(setup: dict[str, Any]) -> list[str]:
     return result
 
 
-async def acp_event_stream(client: AcpClient) -> AsyncIterator[dict[str, Any]]:
+async def acp_event_stream(
+    client: AcpClient, until: asyncio.Task[Any] | None = None
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield ACP events, stopping once the turn is over.
+
+    ``until`` is the in-flight ``session/prompt`` task. Without it this waits on an empty queue
+    forever: a turn whose last event arrives *before* the prompt resolves leaves the caller parked
+    here, so its completion check never runs and the chat is never finished.
+
+    Cancelling a ``Queue.get`` on timeout is safe -- the item stays queued and ``get`` hands the
+    wakeup to the next getter -- so no event is lost between polls.
+    """
     while True:
-        yield await client.events.get()
+        try:
+            yield await asyncio.wait_for(client.events.get(), timeout=ACP_IDLE_POLL_SECONDS)
+            continue
+        except asyncio.TimeoutError:
+            if until is None or not until.done():
+                continue
+
+        # The turn is over. Keep draining while events still arrive, and stop on the first
+        # quiet window, so a trailing event is not lost to wherever the poll boundary fell.
+        while True:
+            try:
+                yield await asyncio.wait_for(client.events.get(), timeout=ACP_IDLE_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                return
