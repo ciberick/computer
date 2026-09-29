@@ -9,6 +9,21 @@ from contextlib import suppress
 from typing import Any, AsyncIterator
 
 
+# The ``session/update`` kinds an agent uses to replay a conversation on ``session/load``. The
+# spec has the agent stream the whole history back before it answers the load, and these are the
+# kinds that history is made of.
+REPLAYED_HISTORY_UPDATES = frozenset(
+    {
+        "user_message_chunk",
+        "agent_message_chunk",
+        "agent_thought_chunk",
+        "tool_call",
+        "tool_call_update",
+        "plan",
+    }
+)
+
+
 class AcpClient:
     def __init__(
         self,
@@ -159,6 +174,7 @@ class AcpClient:
                     {"sessionId": self.resume_session_id, "cwd": self.cwd, "mcpServers": []},
                 )
                 self.session_id = self.resume_session_id
+                self._discard_replayed_history()
         if setup is None:
             setup = await self.request("session/new", {"cwd": self.cwd, "mcpServers": []})
             session_id = setup.get("sessionId")
@@ -167,6 +183,30 @@ class AcpClient:
             raise RuntimeError("ACP did not return a session id")
         self.setup_result = setup
         self.model_config_id = _extract_model_config_id(setup)
+
+    def _discard_replayed_history(self) -> None:
+        """Drop the conversation the agent replayed while loading the session.
+
+        ACP's ``session/load`` makes the agent stream the entire history back as
+        ``session/update`` notifications before it answers the load. They land in the same queue
+        the next turn reads from, so without this every earlier reply -- text and tool calls --
+        was read as part of the new one: reply N came back holding replies 1..N-1 in front of its
+        own, and the chat grew quadratically.
+
+        By the time the load has been answered the replay is all queued (the reader handles
+        messages in order), so it can be drained here. Anything that is not history -- a mode or
+        command update sent alongside it -- is put back.
+        """
+        kept: list[dict[str, Any]] = []
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not _is_replayed_history(event):
+                kept.append(event)
+        for event in kept:
+            self.events.put_nowait(event)
 
     async def _send(self, payload: dict[str, Any]) -> None:
         assert self.proc is not None and self.proc.stdin is not None
@@ -302,6 +342,14 @@ def _select_permission_option(params: dict[str, Any], kind: str) -> str | None:
             if isinstance(option_id, str) and option_id.strip():
                 return option_id.strip()
     return None
+
+
+def _is_replayed_history(event: dict[str, Any]) -> bool:
+    if event.get("method") != "session/update":
+        return False
+    params = event.get("params")
+    update = params.get("update") if isinstance(params, dict) else None
+    return isinstance(update, dict) and update.get("sessionUpdate") in REPLAYED_HISTORY_UPDATES
 
 
 def acp_text_from_update(params: dict[str, Any]) -> str | None:
