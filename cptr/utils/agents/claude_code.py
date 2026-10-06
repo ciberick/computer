@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shlex
+from collections import deque
 from typing import Any, AsyncIterator
 
 from cptr.env import CLAUDE_CODE_MAX_BUFFER_SIZE
@@ -22,7 +24,86 @@ from cptr.utils.agents.prompts import session_turn_prompt_text
 from cptr.utils.identity import env_for
 
 
-_claude_clients: dict[str, tuple[Any, tuple[Any, ...]]] = {}
+logger = logging.getLogger(__name__)
+
+# session_id -> (client, cache_key, stderr tail). The tail travels with the client because the
+# SDK binds the stderr callback when the CLI process starts, and a cached client keeps that
+# process - and that callback - across turns.
+_claude_clients: dict[str, tuple[Any, tuple[Any, ...], _StderrTail]] = {}
+
+# The levels `claude --effort` accepts (claude_agent_sdk.types.EffortLevel).
+_CLAUDE_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+
+# The SDK's stand-in for the CLI's stderr when no callback is registered
+# (`subprocess_cli.py`, "Command failed with exit code N").
+_STDERR_PLACEHOLDER = "Check stderr output for details"
+
+
+class _StderrTail:
+    """The last lines the Claude Code CLI wrote to stderr.
+
+    Without a `stderr` callback the SDK does not pipe the CLI's stderr at all: it goes to this
+    server's own stderr, and the chat only ever sees "Command failed with exit code 1 ... Check
+    stderr output for details". A CLI that dies on startup - a flag it does not know, a refused
+    `bypassPermissions` under root, a missing login - says why only there.
+    """
+
+    def __init__(self, max_lines: int = 40) -> None:
+        self._lines: deque[str] = deque(maxlen=max_lines)
+
+    def append(self, line: str) -> None:
+        self._lines.append(line)
+
+    def clear(self) -> None:
+        self._lines.clear()
+
+    def text(self, max_chars: int = 2000) -> str:
+        joined = "\n".join(self._lines).strip()
+        return joined[-max_chars:]
+
+
+def _claude_effort(chat_params: dict[str, Any]) -> str | None:
+    """The chat's effort for `claude --effort`, under the same keys the Codex adapter reads."""
+    effort = chat_params.get("reasoningEffort") or chat_params.get("reasoning_effort")
+    if isinstance(effort, str) and effort.strip() in _CLAUDE_EFFORT_LEVELS:
+        return effort.strip()
+    return None
+
+
+def _result_error_message(message: Any) -> str:
+    """Words for a `ResultMessage` with `is_error`, from what the CLI reported."""
+    parts: list[str] = []
+    result = getattr(message, "result", None)
+    if isinstance(result, str) and result.strip():
+        parts.append(result.strip())
+    errors = getattr(message, "errors", None)
+    if isinstance(errors, list):
+        parts.extend(e.strip() for e in errors if isinstance(e, str) and e.strip())
+    status = getattr(message, "api_error_status", None)
+    if isinstance(status, int):
+        parts.append(f"HTTP {status}")
+    reason = getattr(message, "terminal_reason", None) or getattr(message, "subtype", None)
+    if not parts and isinstance(reason, str) and reason:
+        parts.append(reason)
+    return "Claude Code returned an error: " + ("; ".join(parts) or "no details")
+
+
+def _claude_exception_message(exc: BaseException, stderr: _StderrTail) -> str:
+    """The exception as the chat should show it, with the CLI's stderr in place of the placeholder.
+
+    A `ResultError` (SDK 0.2.163+) already carries what the CLI reported, so it stands as is.
+    """
+    message = str(exc)
+    tail = stderr.text()
+    if not tail:
+        if _STDERR_PLACEHOLDER in message:
+            return message.replace(
+                _STDERR_PLACEHOLDER, "Claude Code wrote nothing to stderr before exiting"
+            )
+        return message
+    if _STDERR_PLACEHOLDER in message:
+        return message.replace(_STDERR_PLACEHOLDER, tail)
+    return f"{message}\nClaude Code stderr:\n{tail}"
 
 
 def _claude_query_input(
@@ -80,7 +161,7 @@ async def _disconnect_cached_claude_client(session_id: str) -> None:
 async def _clear_claude_client_cache() -> None:
     cached_clients = list(_claude_clients.values())
     _claude_clients.clear()
-    for client, _ in cached_clients:
+    for client, *_ in cached_clients:
         await client.disconnect()
 
 
@@ -137,10 +218,13 @@ async def run_claude_code_agent(
     launch_args = str(profile.get("launch_args") or "").strip()
     extra_args = tuple(shlex.split(launch_args)) if launch_args else ()
     command = str(profile["command"])
-    cache_key = (workspace, command, home, extra_args, model, permission_mode)
+    effort = _claude_effort(chat_params)
+    # Effort is a launch flag (`--effort`), so a change has to start a new CLI process.
+    cache_key = (workspace, command, home, extra_args, model, permission_mode, effort)
 
     session_id = None
     client = None
+    stderr_tail = _StderrTail()
     try:
         if resume_state:
             value = resume_state.get("session_id")
@@ -153,7 +237,10 @@ async def run_claude_code_agent(
             "env": env,
             "include_partial_messages": True,
             "max_buffer_size": CLAUDE_CODE_MAX_BUFFER_SIZE,
+            "stderr": stderr_tail.append,
         }
+        if effort:
+            options_kwargs["effort"] = effort
         if session_id:
             options_kwargs["resume"] = session_id
         if workspace:
@@ -175,6 +262,9 @@ async def run_claude_code_agent(
 
         if cached:
             client = cached[0]
+            # The callback the running process reports to is the cached client's own.
+            stderr_tail = cached[2]
+            stderr_tail.clear()
         else:
             client = sdk.ClaudeSDKClient(options)
             await client.connect()
@@ -295,6 +385,11 @@ async def run_claude_code_agent(
                                     output="",
                                 )
                 elif class_name == "ResultMessage":
+                    if getattr(message, "is_error", False):
+                        # An API error, max turns, an execution error: the CLI reports it here and
+                        # then exits non-zero. Ending the turn as done would show an empty reply,
+                        # or a partial one, as if it had succeeded.
+                        raise RuntimeError(_result_error_message(message))
                     observed_session_id = (
                         getattr(message, "session_id", None) or observed_session_id
                     )
@@ -311,7 +406,7 @@ async def run_claude_code_agent(
                 old_client = _claude_clients.pop(session_id, (None,))[0] if session_id else None
                 if old_client is not None and old_client is not client:
                     await old_client.disconnect()
-                _claude_clients[observed_session_id] = (client, cache_key)
+                _claude_clients[observed_session_id] = (client, cache_key, stderr_tail)
                 session_id = observed_session_id
             else:
                 await client.disconnect()
@@ -338,4 +433,7 @@ async def run_claude_code_agent(
             await client.disconnect()
         raise
     except Exception as exc:  # noqa: BLE001 - surfaced in the chat.
-        yield AgentError(str(exc))
+        tail = stderr_tail.text()
+        if tail:
+            logger.warning("Claude Code failed: %s\nstderr:\n%s", exc, tail)
+        yield AgentError(_claude_exception_message(exc, stderr_tail))
