@@ -468,6 +468,10 @@ async def refresh_model_list(request: Request):
     """Clear cached provider-discovered models and return the refreshed model list."""
     require_admin(request)
     invalidate_model_cache(request.app.state)
+    # Agent models too: the Claude Code CLI's list is cached until asked again, and this is the
+    # button an admin presses when the list looks out of date.
+    invalidate_agent_detection_cache(request.app.state)
+    await get_agent_status(request.app.state, refresh=True)
     return await _build_model_config(request)
 
 

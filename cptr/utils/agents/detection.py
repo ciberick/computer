@@ -45,9 +45,122 @@ class AgentDetection:
     version: str | None = None
     message: str | None = None
     models: list[str] | None = None
+    # Per model id, what the agent itself reports beyond the id: `display_name`, and
+    # `effort_levels` (a list, empty when the model takes none). Only Claude Code fills it.
+    model_details: dict[str, dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+# ── Claude Code: the models its CLI reports ─────────────────────────────────────────────────
+#
+# The CLI answers the SDK's `initialize` with the account's model picker - aliases resolved,
+# per-model effort levels included - so it, not CLAUDE_MODEL_FALLBACKS, is the source of truth.
+# Asking costs a CLI start (~3 s) and no model call. It is cached per (command, home, version):
+# the version is read by every detection anyway, so a CLI upgrade asks again by itself, and the
+# admin refresh buttons clear it. Detection never waits on a first ask - it answers with the
+# fallbacks and lets the ask finish in the background - except on an explicit refresh.
+
+CLAUDE_MODELS_RETRY_SECONDS = 300
+_claude_models_cache: dict[tuple[str, str | None, str | None], list[dict[str, Any]]] = {}
+_claude_models_failed_at: dict[tuple[str, str | None, str | None], float] = {}
+_claude_models_probes: dict[tuple[str, str | None, str | None], asyncio.Task] = {}
+
+
+def invalidate_claude_models_cache() -> None:
+    _claude_models_cache.clear()
+    _claude_models_failed_at.clear()
+
+
+def _claude_models_from_server_info(info: Any) -> list[dict[str, Any]]:
+    """The usable rows of an `initialize` response's `models`, as cptr model entries.
+
+    An alias (`opus`, `sonnet`) is stored under the id it resolves to, so a chat keeps the model it
+    was started with instead of floating to whatever the alias means next month. `default` stays
+    `default`: it means "the account's default", and the adapter leaves `--model` off for it.
+    """
+    rows = info.get("models") if isinstance(info, dict) else None
+    if not isinstance(rows, list):
+        return []
+    # A CLI that knows about effort marks every model that supports it; one that predates the
+    # field marks none, and then nothing can be said either way.
+    reports_effort = any(isinstance(r, dict) and "supportsEffort" in r for r in rows)
+    models: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict) or row.get("disabled"):
+            continue
+        value = row.get("value")
+        resolved = row.get("resolvedModel")
+        model_id = value if value == "default" else (resolved or value)
+        if not isinstance(model_id, str) or not model_id.strip() or model_id in seen:
+            continue
+        seen.add(model_id)
+        entry: dict[str, Any] = {"id": model_id.strip()}
+        name = row.get("displayName")
+        if isinstance(name, str) and name.strip():
+            entry["display_name"] = name.strip()
+        if reports_effort:
+            levels = row.get("supportedEffortLevels") if row.get("supportsEffort") else []
+            entry["effort_levels"] = [lvl for lvl in levels or [] if isinstance(lvl, str)]
+        models.append(entry)
+    return models
+
+
+async def _read_claude_models(command: str, profile: dict[str, Any]) -> list[dict[str, Any]] | None:
+    try:
+        import claude_agent_sdk as sdk
+    except ImportError:
+        return None
+    env = os.environ.copy()
+    home = os.path.expanduser(str(profile["home"])) if profile.get("home") else None
+    if home:
+        env["HOME"] = home
+    client = sdk.ClaudeSDKClient(
+        sdk.ClaudeAgentOptions(cli_path=command, env=env, cwd=home or os.path.expanduser("~"))
+    )
+    try:
+        await asyncio.wait_for(client.connect(), timeout=30)
+        models = _claude_models_from_server_info(await client.get_server_info())
+        return models or None
+    except Exception:  # noqa: BLE001 - the fallbacks cover any failure here.
+        return None
+    finally:
+        with suppress(Exception):
+            await client.disconnect()
+
+
+async def _claude_live_models(
+    command: str, profile: dict[str, Any], version: str | None, wait: bool
+) -> list[dict[str, Any]] | None:
+    """The CLI's own model list when known; None while it is being asked, or when asking failed."""
+    key = (command, str(profile.get("home") or "") or None, version)
+    if key in _claude_models_cache:
+        return _claude_models_cache[key]
+    loop = asyncio.get_running_loop()
+    failed_at = _claude_models_failed_at.get(key)
+    if not wait and failed_at is not None and loop.time() - failed_at < CLAUDE_MODELS_RETRY_SECONDS:
+        return None
+
+    task = _claude_models_probes.get(key)
+    if task is None or task.done():
+
+        def _store(done: asyncio.Task) -> None:
+            _claude_models_probes.pop(key, None)
+            result = None if done.cancelled() or done.exception() else done.result()
+            if result:
+                _claude_models_cache[key] = result
+                _claude_models_failed_at.pop(key, None)
+            else:
+                _claude_models_failed_at[key] = loop.time()
+
+        task = asyncio.create_task(_read_claude_models(command, profile))
+        task.add_done_callback(_store)
+        _claude_models_probes[key] = task
+    if not wait:
+        return None
+    return await asyncio.shield(task)
 
 
 def _resolve_command(command: str) -> str | None:
@@ -138,7 +251,7 @@ async def _run_probe(
     return proc.returncode or 0, text
 
 
-async def detect_profile(profile: dict[str, Any]) -> AgentDetection:
+async def detect_profile(profile: dict[str, Any], refresh: bool = False) -> AgentDetection:
     raw_command = str(profile.get("command") or "").strip()
     command = _resolve_command(raw_command)
     default_claude_command = profile.get("agent") == "claude_code" and raw_command == "claude"
@@ -191,6 +304,16 @@ async def detect_profile(profile: dict[str, Any]) -> AgentDetection:
                 version,
                 "Python package claude-agent-sdk is not installed",
                 models,
+            )
+        live = await _claude_live_models(command, profile, version, wait=refresh)
+        if live:
+            return AgentDetection(
+                "ready",
+                command,
+                version,
+                None,
+                [entry["id"] for entry in live],
+                {entry["id"]: {k: v for k, v in entry.items() if k != "id"} for entry in live},
             )
         return AgentDetection("ready", command, version, None, models)
 
@@ -645,7 +768,7 @@ async def get_agent_status(app_state=None, refresh: bool = False) -> dict[str, A
     entries = []
     candidates = profiles if not implicit_defaults else default_agent_profiles()
     for profile in candidates:
-        detected = await detect_profile(profile)
+        detected = await detect_profile(profile, refresh=refresh)
         if implicit_defaults and detected.status in {"not_found", "error"}:
             continue
         mode = profile.get("mode", "auto")
@@ -682,27 +805,31 @@ async def get_agent_status(app_state=None, refresh: bool = False) -> dict[str, A
 
 
 def invalidate_agent_detection_cache(app_state) -> None:
+    invalidate_claude_models_cache()
     if app_state is not None and hasattr(app_state, "AGENTS"):
         delattr(app_state, "AGENTS")
 
 
-async def get_available_agent_model_entries(app_state=None) -> list[dict[str, str]]:
+async def get_available_agent_model_entries(app_state=None) -> list[dict[str, Any]]:
     status = await get_agent_status(app_state)
-    entries: list[dict[str, str]] = []
+    entries: list[dict[str, Any]] = []
     for profile in status["profiles"]:
         if not profile["available"]:
             continue
         config = profile["config"]
+        details = (profile.get("detected") or {}).get("model_details") or {}
         for model in config.get("models") or []:
             model_id = model_id_for_profile(config, model)
-            entries.append(
-                {
-                    "id": model_id,
-                    "name": model_id,
-                    "provider": "agent",
-                    "connection_id": f"agent:{config['id']}",
-                    "agent_id": config["agent"],
-                    "profile_id": config["id"],
-                }
-            )
+            entry: dict[str, Any] = {
+                "id": model_id,
+                "name": model_id,
+                "provider": "agent",
+                "connection_id": f"agent:{config['id']}",
+                "agent_id": config["agent"],
+                "profile_id": config["id"],
+            }
+            # Extra keys only when the agent reported them, so clients that read only the
+            # original six see exactly what they saw before.
+            entry.update(details.get(model) or {})
+            entries.append(entry)
     return entries
