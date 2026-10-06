@@ -27,14 +27,14 @@ dependencies = [
 pam = ["python-pam>=2.0"]
 mcp = ["mcp>=1.8,<2"]
 docs = ["pypdf>=4.0", "python-docx>=1.0", "openpyxl>=3.1"]
-agents = ["claude-agent-sdk>=0.1.62"]
+agents = ["claude-agent-sdk>=0.2.163"]
 all = [
     "mcp>=1.8,<2",
     "pypdf>=4.0",
     "python-docx>=1.0",
     "openpyxl>=3.1",
     "python-pam>=2.0",
-    "claude-agent-sdk>=0.1.62",
+    "claude-agent-sdk>=0.2.163",
 ]
 
 [dependency-groups]
