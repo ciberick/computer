@@ -26,3 +26,7 @@ cptr/frontend/.svelte-kit/
 Thumbs.db
 
 .cptr
+
+# install.sh
+cptr.pid
+cptr.log
