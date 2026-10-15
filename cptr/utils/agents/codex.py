@@ -12,6 +12,7 @@ from contextlib import suppress
 from typing import Any, AsyncIterator
 
 from cptr.utils.agents.attachments import PreparedAgentAttachments
+from cptr.utils.agents.cptr_mcp import MCP_SERVER_NAME, TOKEN_ENV_VAR, CptrMcpSpec
 from cptr.utils.agents.events import (
     AgentDone,
     AgentError,
@@ -29,8 +30,16 @@ CODEX_MAX_WIRE_MESSAGE_CHARS = 16 * 1024 * 1024
 
 
 class CodexAppServer:
-    def __init__(self, command: str, cwd: str, env: dict[str, str], preexec_fn=None) -> None:
+    def __init__(
+        self,
+        command: str,
+        cwd: str,
+        env: dict[str, str],
+        preexec_fn=None,
+        config_args: list[str] | None = None,
+    ) -> None:
         self.command = command
+        self.config_args = config_args or []
         self.cwd = cwd
         self.env = env
         self.preexec_fn = preexec_fn
@@ -47,6 +56,7 @@ class CodexAppServer:
         self.proc = await asyncio.create_subprocess_exec(
             self.command,
             "app-server",
+            *self.config_args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -188,6 +198,19 @@ class CodexAppServer:
         if method in {"applyPatchApproval", "execCommandApproval"}:
             decision = "denied" if self.approval_mode == "ask" else "approved"
             await self.respond(request_id, {"decision": decision})
+            return
+        params = message.get("params")
+        if (
+            method == "mcpServer/elicitation/request"
+            and isinstance(params, dict)
+            and params.get("serverName") == MCP_SERVER_NAME
+        ):
+            # cptr's server never elicits; this is Codex asking to approve a cptr tool call.
+            # It follows the same rule as commands and file changes above.
+            if self.approval_mode == "ask":
+                await self.respond(request_id, {"action": "decline"})
+            else:
+                await self.respond(request_id, {"action": "accept", "content": {}})
             return
         await self.respond_error(request_id, -32601, f"Method not found: {method}")
 
@@ -363,16 +386,25 @@ async def run_codex_agent(
     resume_state: dict[str, Any] | None,
     attachments: PreparedAgentAttachments,
     identity=None,
+    cptr_mcp: CptrMcpSpec | None = None,
 ) -> AsyncIterator[AgentEvent]:
     env = env_for(identity, workspace) if identity and identity.is_pam else os.environ.copy()
     if profile.get("home"):
         env["CODEX_HOME"] = os.path.expanduser(str(profile["home"]))
+    config_args: list[str] = []
+    if cptr_mcp:
+        # The token goes through the environment so it never shows up in `ps`.
+        env[TOKEN_ENV_VAR] = cptr_mcp.token
+        config_args = cptr_mcp.codex_config_args(
+            auto_approve=_chat_approval_mode(chat_params) != "ask"
+        )
 
     client = CodexAppServer(
         str(profile["command"]),
         workspace,
         env,
         preexec_for(identity) if identity and identity.is_pam else None,
+        config_args,
     )
     thread_id: str | None = None
     turn_id: str | None = None

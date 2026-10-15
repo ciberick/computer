@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from cptr.routers import (
     admin_router,
+    agent_mcp_router,
     audio_router,
     auth_router,
     automations_router,
@@ -142,6 +143,8 @@ async def auth_middleware(request: Request, call_next):
         or path == "/api/config"
         or path == "/api/changelog"
         or path == "/manifest.json"
+        # Agent MCP endpoint checks its own per-chat bearer token (loopback only).
+        or path == "/api/mcp/agent"
     ):
         return await call_next(request)
     if path.startswith("/_app/") or path.startswith("/v1/") or not path.startswith("/api/"):
@@ -277,6 +280,7 @@ async def get_config():
 
 # Routers
 app.include_router(admin_router)
+app.include_router(agent_mcp_router)
 app.include_router(audio_router)
 app.include_router(auth_router)
 app.include_router(automations_router)
