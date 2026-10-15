@@ -28,6 +28,7 @@ def run(host: str, port: int, reload: bool, headless: bool):
     token = secrets.token_hex(32)
     os.environ["CPTR_STARTUP_TOKEN"] = token
     os.environ["CPTR_PORT"] = str(port)
+    os.environ["CPTR_HOST"] = host
     url = f"http://{display_host}:{port}/?token={token}"
 
     print(f"\n  ➜  {url}\n")

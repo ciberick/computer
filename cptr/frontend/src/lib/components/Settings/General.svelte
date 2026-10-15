@@ -8,6 +8,9 @@
 		latestVersion
 	} from '$lib/stores';
 	import type { StreamingBehavior } from '$lib/stores';
+	import { onMount } from 'svelte';
+	import { toast } from 'svelte-sonner';
+	import { getAdminConfig, updateConfig } from '$lib/apis/admin';
 	import { t, locale, changeLocale, supportedLocales } from '$lib/i18n';
 	import { session } from '$lib/session';
 	import ToggleSwitch from '../common/ToggleSwitch.svelte';
@@ -38,6 +41,64 @@
 
 	let copied = $state(false);
 	let resetting = $state(false);
+
+	// cptr tools exposed to external agents (Claude Code, Codex…) over MCP. Server config, admin only.
+	const AGENT_TOOL_GROUPS = ['automations', 'notifications', 'memory'] as const;
+	type AgentToolGroup = (typeof AGENT_TOOL_GROUPS)[number];
+
+	let agentToolsLoaded = $state(false);
+	let agentToolsEnabled = $state(false);
+	let agentToolGroups = $state<Record<AgentToolGroup, boolean>>({
+		automations: true,
+		notifications: true,
+		memory: true
+	});
+	let memoryEnabled = $state(true);
+
+	onMount(async () => {
+		if ($session?.role !== 'admin') return;
+		try {
+			const config = await getAdminConfig();
+			agentToolsEnabled =
+				config['agents.cptr_tools.enabled'] === true ||
+				config['agents.cptr_tools.enabled'] === 'true';
+			const groups = config['agents.cptr_tools.groups'];
+			if (groups && typeof groups === 'object') {
+				for (const group of AGENT_TOOL_GROUPS) {
+					agentToolGroups[group] = (groups as Record<string, unknown>)[group] !== false;
+				}
+			}
+			const memory = config['memory.enabled'];
+			memoryEnabled = !(memory === false || memory === 'false' || memory === '0');
+			agentToolsLoaded = true;
+		} catch {
+			toast.error($t('admin.failedToLoadConfig'));
+		}
+	});
+
+	async function saveAgentTools(updates: Record<string, unknown>, revert: () => void) {
+		try {
+			await updateConfig(updates);
+		} catch {
+			revert();
+			toast.error($t('admin.failedToSave'));
+		}
+	}
+
+	function setAgentToolsEnabled(value: boolean) {
+		const previous = agentToolsEnabled;
+		agentToolsEnabled = value;
+		saveAgentTools({ 'agents.cptr_tools.enabled': value }, () => (agentToolsEnabled = previous));
+	}
+
+	function setAgentToolGroup(group: AgentToolGroup, value: boolean) {
+		const previous = { ...agentToolGroups };
+		agentToolGroups = { ...agentToolGroups, [group]: value };
+		saveAgentTools(
+			{ 'agents.cptr_tools.groups': agentToolGroups },
+			() => (agentToolGroups = previous)
+		);
+	}
 
 	function copyLink() {
 		navigator.clipboard.writeText(REPO_URL);
@@ -147,6 +208,52 @@
 			<p class="text-[0.6875rem] text-gray-400 dark:text-gray-600 mt-1">
 				{$t('general.updateNotificationsDesc')}
 			</p>
+
+			{#if agentToolsLoaded}
+				<h3 class="text-xs text-gray-400 dark:text-gray-600 mb-2 mt-5">
+					{$t('general.agentTools')}
+				</h3>
+				<label class="flex items-center justify-between cursor-pointer">
+					<span class="text-xs text-gray-600 dark:text-gray-400"
+						>{$t('general.agentToolsEnabled')}</span
+					>
+					<ToggleSwitch
+						value={agentToolsEnabled}
+						onchange={setAgentToolsEnabled}
+						ariaLabel={$t('general.agentToolsEnabled')}
+					/>
+				</label>
+				<p class="text-[0.6875rem] text-gray-400 dark:text-gray-600 mt-1">
+					{$t('general.agentToolsDesc')}
+				</p>
+
+				{#if agentToolsEnabled}
+					<div class="flex flex-col gap-2 mt-2.5 pl-3">
+						{#each AGENT_TOOL_GROUPS as group}
+							{@const unavailable = group === 'memory' && !memoryEnabled}
+							<label
+								class="flex items-center justify-between
+								{unavailable ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}"
+							>
+								<span class="text-xs text-gray-600 dark:text-gray-400"
+									>{$t(`models.builtinTools.${group}`)}</span
+								>
+								<ToggleSwitch
+									value={agentToolGroups[group] && !unavailable}
+									disabled={unavailable}
+									onchange={(v) => setAgentToolGroup(group, v)}
+									ariaLabel={$t(`models.builtinTools.${group}`)}
+								/>
+							</label>
+						{/each}
+						{#if !memoryEnabled}
+							<p class="text-[0.6875rem] text-gray-400 dark:text-gray-600">
+								{$t('general.agentToolsMemoryDisabled')}
+							</p>
+						{/if}
+					</div>
+				{/if}
+			{/if}
 		{/if}
 
 		<h3 class="text-xs text-gray-400 dark:text-gray-600 mb-2 mt-5">{$t('general.messageQueue')}</h3>

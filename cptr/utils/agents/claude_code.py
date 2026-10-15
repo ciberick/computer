@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator
 
 from cptr.env import CLAUDE_CODE_MAX_BUFFER_SIZE
 from cptr.utils.agents.attachments import PreparedAgentAttachments
+from cptr.utils.agents.cptr_mcp import CptrMcpSpec
 from cptr.utils.agents.events import (
     AgentDone,
     AgentError,
@@ -202,6 +203,7 @@ async def run_claude_code_agent(
     resume_state: dict[str, Any] | None,
     attachments: PreparedAgentAttachments,
     identity=None,
+    cptr_mcp: CptrMcpSpec | None = None,
 ) -> AsyncIterator[AgentEvent]:
     try:
         import claude_agent_sdk as sdk
@@ -220,7 +222,9 @@ async def run_claude_code_agent(
     command = str(profile["command"])
     effort = _claude_effort(chat_params)
     # Effort is a launch flag (`--effort`), so a change has to start a new CLI process.
-    cache_key = (workspace, command, home, extra_args, model, permission_mode, effort)
+    # MCP servers are fixed when the CLI starts, so enabling or changing them restarts it too.
+    mcp_key = (cptr_mcp.url, cptr_mcp.token, cptr_mcp.tools) if cptr_mcp else None
+    cache_key = (workspace, command, home, extra_args, model, permission_mode, effort, mcp_key)
 
     session_id = None
     client = None
@@ -247,6 +251,12 @@ async def run_claude_code_agent(
             options_kwargs["cwd"] = workspace
         if extra_args:
             options_kwargs["extra_args"] = {arg: None for arg in extra_args}
+        if cptr_mcp:
+            options_kwargs["mcp_servers"] = cptr_mcp.claude_code_servers()
+            # cptr tools follow the chat's approval mode like Claude Code's own tools: there is
+            # no prompt to answer in "default" mode, so only auto/full pre-approve them.
+            if permission_mode != "default":
+                options_kwargs["allowed_tools"] = cptr_mcp.claude_code_allowed_tools()
 
         options = sdk.ClaudeAgentOptions(**options_kwargs)
         options.cli_path = command

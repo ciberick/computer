@@ -71,6 +71,7 @@ from cptr.utils.agents.events import (
     AgentToolUpdate,
 )
 from cptr.utils.agents.attachments import prepare_agent_attachments
+from cptr.utils.agents.cptr_mcp import CptrMcpSpec, cptr_mcp_url, cptr_tools_prompt
 from cptr.utils.model_targets import AgentModelTarget, ApiModelTarget, ModelTarget
 from cptr.utils.identity import identity_for_context
 
@@ -211,6 +212,38 @@ def resolve_builtin_tools_config(
             merged.update(value)
             found = True
     return merged if found else None
+
+
+# Agents whose runner accepts ``cptr_mcp`` (cptr tools over MCP).
+CPTR_MCP_AGENTS = {"claude_code", "codex"}
+
+
+async def _agent_cptr_mcp_spec(
+    chat_obj, user_id: str, workspace: str, full_model_id: str
+) -> CptrMcpSpec | None:
+    """Grant this chat's agent the enabled cptr tools, or None when there are none."""
+    from cptr.utils.agent_tool_grant import granted_tool_names, issue_grant
+
+    try:
+        chat_models_config = await Config.get("chat.models") or {}
+    except Exception:
+        chat_models_config = {}
+    builtin_tools = resolve_builtin_tools_config(chat_models_config, full_model_id)
+    automation_run = bool((chat_obj.meta or {}).get("automation_id"))
+    tools = await granted_tool_names(
+        workspace=workspace, builtin_tools=builtin_tools, automation_run=automation_run
+    )
+    if not tools:
+        return None
+    token = issue_grant(
+        user_id=user_id,
+        chat_id=chat_obj.id,
+        workspace=workspace,
+        model_id=full_model_id,
+        builtin_tools=builtin_tools,
+        automation_run=automation_run,
+    )
+    return CptrMcpSpec(url=cptr_mcp_url(), token=token, tools=tuple(tools))
 
 
 COMPUTER_SKILL_AUTHORING_STANDARDS = """\
@@ -1617,6 +1650,16 @@ async def run_chat_task(
             messages.append({"role": "user", "content": PLAN_MODE_PROMPT})
         system = await _apply_voice_mode_system_prompt(system, chat_params)
 
+        runner_kwargs: dict[str, Any] = {}
+        if agent_target.agent in CPTR_MCP_AGENTS and chat_obj:
+            cptr_mcp = await _agent_cptr_mcp_spec(
+                chat_obj, user_id, workspace or "", agent_target.full_model_id
+            )
+            if cptr_mcp:
+                runner_kwargs["cptr_mcp"] = cptr_mcp
+                tools_prompt = cptr_tools_prompt(cptr_mcp)
+                system = f"{system}\n\n{tools_prompt}" if system else tools_prompt
+
         resume_state = None
         if chat_obj:
             sessions = (chat_obj.meta or {}).get("agent_sessions") or {}
@@ -1668,6 +1711,7 @@ async def run_chat_task(
             resume_state=resume_state,
             attachments=agent_attachments,
             identity=identity,
+            **runner_kwargs,
         ):
             if isinstance(event, AgentTextDelta):
                 await _finish_reasoning_item()
