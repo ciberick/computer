@@ -1,6 +1,36 @@
 # Tools de cptr para agentes externos vía MCP
 
-Estado: fase 1 implementada en `feat/agent-mcp-tools` · Fork ciberick/computer · Fecha: 2026-10-14
+Estado: fases 1 y 2 implementadas · Fork ciberick/computer · Actualizado: 2026-10-15
+
+## 0b. Modelos de automatización y fase 2 (Cursor)
+
+**Modelos (`feat/automation-models`).** Codex guardó `agent:grok4.7` en lugar de
+`agent:cursor/grok-4.7`: `create_automation` no aceptaba modelo, `update_automation` aceptaba
+cualquier texto y nada listaba los IDs válidos. Ahora:
+- Tool `list_models` (grupo automatizaciones) con la misma lista que `GET /api/models`
+  (`routers/chat.py:list_available_models`).
+- `model_id` opcional en `create_automation`; create y update lo validan y, si no existe,
+  responden con sugerencias ("Did you mean: agent:cursor/grok-4.7?").
+- update/toggle/delete solo actúan sobre automatizaciones del propio usuario.
+- `create_automation` rechaza un `user_id` que no existe (cierra el atajo de importar cptr con
+  un usuario inventado, visto en el chat `2f4bba7b`).
+- Codex muestra servidor, tool, argumentos y resultado de cada llamada MCP.
+
+**Fase 2 (`feat/agent-mcp-cursor`).**
+- Cursor anuncia `mcpCapabilities.http: true` (verificado con `initialize`), así que recibe el
+  servidor `cptr` por HTTP en `session/new` y `session/load`. El puente stdio no hizo falta.
+- Cursor pide permiso para cada tool MCP con el título `cptr-<tool>: <tool>`, y cptr en modo
+  auto cancela todos los permisos de Cursor. Se aprueba (`allow_once`) solo cuando el título
+  coincide exactamente con una tool concedida y el `kind` no es un comando ni una edición, en
+  modo auto o full; en "preguntar" se sigue cancelando.
+- Agentes sin MCP todavía (OpenCode, Gemini, Cline, Grok, Pi): con el interruptor activo reciben
+  un bloque `<cptr_tools>` que dice que esas funciones no están disponibles y que no las imiten.
+- Probado con el runner real de Cursor: la petición original ("usar el modelo agent grok4.7")
+  terminó en `list_models` + `create_automation` con `agent:cursor/grok-4.7`.
+
+Pendiente (fase 3): OpenCode, Gemini, Cline y Grok, sin CLI local para probarlos; puente stdio
+solo si alguno no admite MCP por HTTP; servidores de "Servidores de herramientas" vía el mismo
+endpoint.
 
 ## 0. Fase 1: lo implementado y en qué cambió respecto al diseño
 
