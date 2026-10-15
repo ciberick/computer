@@ -294,11 +294,19 @@ async def get_models(request: Request):
     Otherwise, call the provider's /models endpoint to discover available models.
     """
     _get_user(request)
+    models = await list_available_models(request.app.state)
+    default_model = await Config.get("chat.default_model")
+    return {"models": models, "default": default_model}
+
+
+async def list_available_models(app_state) -> list[dict]:
+    """Models a chat or automation can use: every enabled connection plus detected agents,
+    minus the ones turned off in chat.models. Same list the model picker shows."""
     connections = [c for c in await _get_connections() if c.get("enabled", True)]
     models = []
 
     for conn in connections:
-        model_ids = await _get_connection_models(conn, request.app.state)
+        model_ids = await _get_connection_models(conn, app_state)
 
         prefix = (conn.get("prefix_id") or "").strip()
 
@@ -315,17 +323,14 @@ async def get_models(request: Request):
 
     from cptr.utils.agents.detection import get_available_agent_model_entries
 
-    models.extend(await get_available_agent_model_entries(request.app.state))
-
-    default_model = await Config.get("chat.default_model")
+    models.extend(await get_available_agent_model_entries(app_state))
 
     # Filter out inactive models
     chat_models_config = await Config.get("chat.models") or {}
     inactive = {k for k, v in chat_models_config.items() if v.get("is_active") is False}
     if inactive:
         models = [m for m in models if m["id"] not in inactive]
-
-    return {"models": models, "default": default_model}
+    return models
 
 
 @router.get("/usage")
