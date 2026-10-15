@@ -12,10 +12,12 @@ never exposed to the LLM — they carry injected execution context:
 from __future__ import annotations
 
 import asyncio
+import difflib
 import inspect
 import json
 import mimetypes
 import os
+import re
 import stat
 import time
 import uuid
@@ -1549,10 +1551,84 @@ def _resolve_path(path: str, workspace: str) -> Path:
     return full
 
 
+async def _available_models(__context__: dict) -> list[dict]:
+    """The models the picker offers (connections + detected agents, minus inactive ones)."""
+    from types import SimpleNamespace
+
+    from cptr.routers.chat import list_available_models
+
+    request = __context__.get("request")
+    app_state = getattr(getattr(request, "app", None), "state", None) or SimpleNamespace()
+    return await list_available_models(app_state)
+
+
+def _normalize_model_id(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _model_suggestions(model_id: str, ids: list[str], limit: int = 3) -> list[str]:
+    """Likely meant ids: "agent:grok4.7" → "agent:cursor/grok-4.7"."""
+    wanted = _normalize_model_id(model_id).removeprefix("agent")
+    found = [i for i in ids if wanted and wanted in _normalize_model_id(i)]
+    found += difflib.get_close_matches(model_id, ids, n=limit, cutoff=0.5)
+    return list(dict.fromkeys(found))[:limit]
+
+
+async def _unknown_model_error(model_id: str, __context__: dict) -> str | None:
+    """None when model_id is one the picker offers, else an error naming likely ids."""
+    try:
+        ids = [m["id"] for m in await _available_models(__context__)]
+    except Exception:
+        ids = []
+    if not ids or model_id in ids:
+        # Without a list to check against, don't block (same as before validation existed).
+        return None
+    message = f"Unknown model '{model_id}'."
+    suggestions = _model_suggestions(model_id, ids)
+    if suggestions:
+        message += " Did you mean: " + ", ".join(suggestions) + "?"
+    message += " Call list_models for the exact ids."
+    return json.dumps({"error": message})
+
+
+async def _owned_automation(automation_id: str, __context__: dict):
+    """The automation if it belongs to the context's user; another user's reads as missing."""
+    from cptr.models.automations import Automation as AutomationModel
+
+    automation = await AutomationModel.get_by_id(automation_id)
+    if not automation or automation.user_id != __context__.get("user_id"):
+        return None
+    return automation
+
+
+async def list_models(*, __context__: dict) -> str:
+    """List the models an automation can run on, with the exact id to pass as model_id (agents look like "agent:cursor/grok-4.7")."""
+    try:
+        models = await _available_models(__context__)
+    except Exception as e:
+        return json.dumps({"error": f"Could not load models: {e}"})
+    return json.dumps(
+        {
+            "models": [
+                {
+                    "id": m["id"],
+                    "name": m.get("display_name") or m.get("name") or m["id"],
+                    "type": "agent" if m.get("provider") == "agent" else "api",
+                    **({"agent": m["agent_id"]} if m.get("agent_id") else {}),
+                }
+                for m in models
+            ],
+            "current": __context__.get("full_model_id") or __context__.get("model_id") or "",
+        },
+        ensure_ascii=False,
+    )
+
+
 async def create_automation(
     name: str,
     prompt: str,
     rrule: str,
+    model_id: str = "",
     *,
     __context__: dict,
 ) -> str:
@@ -1566,10 +1642,12 @@ async def create_automation(
     :param name: A short descriptive name for the automation.
     :param prompt: The instructions/prompt to execute on each run.
     :param rrule: An iCalendar RRULE string defining the schedule.
+    :param model_id: Model that runs the automation, exactly as returned by list_models. Empty uses the current chat's model.
     """
     workspace = __context__["workspace"]
     user_id = __context__["user_id"]
-    model_id = __context__.get("model_id", "")
+    requested_model = model_id.strip()
+    model_id = requested_model or __context__.get("model_id", "")
 
     try:
         import time
@@ -1584,6 +1662,13 @@ async def create_automation(
 
         if not model_id:
             return json.dumps({"error": "Could not detect model from current chat context."})
+        if requested_model and (error := await _unknown_model_error(model_id, __context__)):
+            return error
+
+        from cptr.models.users import User
+
+        if not await User.get_by_id(user_id):
+            return json.dumps({"error": "Unknown user: automations must belong to a cptr user."})
 
         now_ns = int(time.time() * 1_000_000_000)
         nxt = next_run_ns(rrule)
@@ -1669,14 +1754,14 @@ async def update_automation(
     :param name: New name (optional).
     :param prompt: New prompt/instructions (optional).
     :param rrule: New iCalendar RRULE schedule string (optional).
-    :param model_id: New model ID (optional).
+    :param model_id: New model, exactly as returned by list_models (optional).
     """
     try:
         import time
         from cptr.models.automations import Automation as AutomationModel
         from cptr.utils.automations import next_run_ns, next_n_runs_ns, validate_rrule
 
-        automation = await AutomationModel.get_by_id(automation_id)
+        automation = await _owned_automation(automation_id, __context__)
         if not automation:
             return json.dumps({"error": "Automation not found"})
 
@@ -1685,7 +1770,10 @@ async def update_automation(
             kwargs["name"] = name
         if prompt:
             kwargs["prompt"] = prompt
+        model_id = model_id.strip()
         if model_id:
+            if error := await _unknown_model_error(model_id, __context__):
+                return error
             kwargs["model_id"] = model_id
         if rrule:
             try:
@@ -1728,7 +1816,7 @@ async def toggle_automation(
         from cptr.models.automations import Automation as AutomationModel
         from cptr.utils.automations import next_run_ns
 
-        automation = await AutomationModel.get_by_id(automation_id)
+        automation = await _owned_automation(automation_id, __context__)
         if not automation:
             return json.dumps({"error": "Automation not found"})
 
@@ -1760,7 +1848,7 @@ async def delete_automation(
     try:
         from cptr.models.automations import Automation as AutomationModel
 
-        automation = await AutomationModel.get_by_id(automation_id)
+        automation = await _owned_automation(automation_id, __context__)
         if not automation:
             return json.dumps({"error": "Automation not found"})
 
@@ -2430,6 +2518,7 @@ TOOLS: dict[str, dict] = {
     "read_url": {"fn": read_url, "approval": "allow"},
     "search_chats": {"fn": search_chats, "approval": "allow"},
     "list_automations": {"fn": list_automations, "approval": "allow"},
+    "list_models": {"fn": list_models, "approval": "allow"},
     "view_skill": {"fn": view_skill, "approval": "allow"},
     "update_tasks": {"fn": update_tasks, "approval": "allow"},
     # Missing approval inherits tool_approval.default_builtin_approval.
@@ -2877,6 +2966,7 @@ BUILTIN_TOOL_GROUPS: dict[str, tuple[str, ...]] = {
     "tasks": ("update_tasks",),
     "automations": (
         "list_automations",
+        "list_models",
         "create_automation",
         "update_automation",
         "toggle_automation",

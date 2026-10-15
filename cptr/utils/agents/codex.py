@@ -315,6 +315,8 @@ def _tool_from_item_event(method: str, params: dict[str, Any]) -> AgentToolUpdat
     call_id = params.get("itemId") or item.get("id") or item.get("callId")
     if not isinstance(call_id, str) or not call_id.strip():
         return None
+    if item_type == "mcpToolCall":
+        return _mcp_tool_update(method, call_id.strip(), item)
     title = str(item.get("title") or item.get("name") or item_type or "Codex action").strip()
     detail = _item_detail(item)
     return AgentToolUpdate(
@@ -325,6 +327,35 @@ def _tool_from_item_event(method: str, params: dict[str, Any]) -> AgentToolUpdat
         if "command" in normalized_type and detail
         else {"title": title},
         output=None,
+    )
+
+
+def _mcp_tool_update(method: str, call_id: str, item: dict[str, Any]) -> AgentToolUpdate:
+    """An MCP call with its server, tool, arguments and result, so the chat shows what ran."""
+    server = str(item.get("server") or "mcp")
+    tool = str(item.get("tool") or "tool")
+    raw_arguments = item.get("arguments")
+    arguments = dict(raw_arguments) if isinstance(raw_arguments, dict) else {}
+    arguments["title"] = f"{server}.{tool}"
+    output = None
+    if method == "item/completed":
+        error = item.get("error")
+        result = item.get("result")
+        if isinstance(error, dict) and error.get("message"):
+            output = f"Error: {error['message']}"
+        elif isinstance(result, dict):
+            texts = [
+                block.get("text", "")
+                for block in result.get("content") or []
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            output = "\n".join(text for text in texts if text) or None
+    return AgentToolUpdate(
+        call_id=call_id,
+        name="agent_tool",
+        status="completed" if method == "item/completed" else "in_progress",
+        arguments=arguments,
+        output=output,
     )
 
 

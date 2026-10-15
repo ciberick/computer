@@ -58,11 +58,18 @@ def cptr_mcp_url() -> str:
 
 def cptr_tools_prompt(spec: CptrMcpSpec) -> str:
     tools = ", ".join(spec.tools)
+    model_hint = (
+        "When the user names a model for an automation, call list_models and pass its exact id "
+        "as model_id; never guess an id.\n"
+        if "list_models" in spec.tools
+        else ""
+    )
     return (
         "<cptr_tools>\n"
         f'cptr exposes these tools to you through the MCP server "{MCP_SERVER_NAME}": {tools}.\n'
         "Use them for scheduled or recurring work, notifying the user, and saving durable "
         "memory. Do not emulate them with cron, sleep loops, systemd timers, or by importing "
         "cptr's Python code.\n"
+        f"{model_hint}"
         "</cptr_tools>"
     )
