@@ -71,7 +71,13 @@ from cptr.utils.agents.events import (
     AgentToolUpdate,
 )
 from cptr.utils.agents.attachments import prepare_agent_attachments
-from cptr.utils.agents.cptr_mcp import CptrMcpSpec, cptr_mcp_url, cptr_tools_prompt
+from cptr.utils.agent_tool_grant import agent_tools_enabled
+from cptr.utils.agents.cptr_mcp import (
+    CPTR_TOOLS_UNAVAILABLE_PROMPT,
+    CptrMcpSpec,
+    cptr_mcp_url,
+    cptr_tools_prompt,
+)
 from cptr.utils.model_targets import AgentModelTarget, ApiModelTarget, ModelTarget
 from cptr.utils.identity import identity_for_context
 
@@ -215,7 +221,7 @@ def resolve_builtin_tools_config(
 
 
 # Agents whose runner accepts ``cptr_mcp`` (cptr tools over MCP).
-CPTR_MCP_AGENTS = {"claude_code", "codex"}
+CPTR_MCP_AGENTS = {"claude_code", "codex", "cursor"}
 
 
 async def _agent_cptr_mcp_spec(
@@ -1651,6 +1657,7 @@ async def run_chat_task(
         system = await _apply_voice_mode_system_prompt(system, chat_params)
 
         runner_kwargs: dict[str, Any] = {}
+        tools_prompt = ""
         if agent_target.agent in CPTR_MCP_AGENTS and chat_obj:
             cptr_mcp = await _agent_cptr_mcp_spec(
                 chat_obj, user_id, workspace or "", agent_target.full_model_id
@@ -1658,7 +1665,10 @@ async def run_chat_task(
             if cptr_mcp:
                 runner_kwargs["cptr_mcp"] = cptr_mcp
                 tools_prompt = cptr_tools_prompt(cptr_mcp)
-                system = f"{system}\n\n{tools_prompt}" if system else tools_prompt
+        elif await agent_tools_enabled():
+            tools_prompt = CPTR_TOOLS_UNAVAILABLE_PROMPT
+        if tools_prompt:
+            system = f"{system}\n\n{tools_prompt}" if system else tools_prompt
 
         resume_state = None
         if chat_obj:

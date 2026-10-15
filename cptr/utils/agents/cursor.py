@@ -8,6 +8,7 @@ from contextlib import suppress
 from typing import Any, AsyncIterator
 
 from cptr.utils.agents.attachments import PreparedAgentAttachments
+from cptr.utils.agents.cptr_mcp import CptrMcpSpec
 from cptr.utils.agents.acp import (
     AcpClient,
     acp_event_stream,
@@ -34,6 +35,10 @@ def _auto_approve(chat_params: dict[str, Any]) -> bool:
     return bool(chat_params.get("auto_approve_tools"))
 
 
+def _ask_mode(chat_params: dict[str, Any]) -> bool:
+    return chat_params.get("tool_approval_mode") == "ask"
+
+
 async def run_cursor_agent(
     *,
     profile: dict[str, Any],
@@ -45,6 +50,7 @@ async def run_cursor_agent(
     resume_state: dict[str, Any] | None,
     attachments: PreparedAgentAttachments,
     identity=None,
+    cptr_mcp: CptrMcpSpec | None = None,
 ) -> AsyncIterator[AgentEvent]:
     env = env_for(identity, workspace) if identity and identity.is_pam else os.environ.copy()
     if profile.get("home"):
@@ -70,6 +76,8 @@ async def run_cursor_agent(
         resume_session_id=session_id,
         auto_approve_permissions=_auto_approve(chat_params),
         preexec_fn=preexec_for(identity) if identity and identity.is_pam else None,
+        cptr_mcp=cptr_mcp,
+        approve_cptr_tools=not _ask_mode(chat_params),
     )
     try:
         await client.start()

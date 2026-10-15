@@ -25,6 +25,15 @@ class CptrMcpSpec:
     def claude_code_allowed_tools(self) -> list[str]:
         return [f"mcp__{MCP_SERVER_NAME}__{name}" for name in self.tools]
 
+    def acp_http_server(self) -> dict:
+        """An ACP ``McpServer`` entry (HTTP transport) for session/new and session/load."""
+        return {
+            "type": "http",
+            "name": MCP_SERVER_NAME,
+            "url": self.url,
+            "headers": [{"name": k, "value": v} for k, v in self.auth_headers().items()],
+        }
+
     def codex_config_args(self, *, auto_approve: bool) -> list[str]:
         """`-c` overrides for `codex app-server`; the token travels in TOKEN_ENV_VAR."""
         prefix = f"mcp_servers.{MCP_SERVER_NAME}"
@@ -73,3 +82,14 @@ def cptr_tools_prompt(spec: CptrMcpSpec) -> str:
         f"{model_hint}"
         "</cptr_tools>"
     )
+
+
+# For agents that cptr cannot hand its MCP server to yet, so they don't improvise one.
+CPTR_TOOLS_UNAVAILABLE_PROMPT = (
+    "<cptr_tools>\n"
+    "cptr's automations, notifications and memory are not available to you in this chat. If "
+    "the user asks for one, say so and suggest the Automations page or a Claude Code, Codex or "
+    "Cursor chat. Do not emulate them with cron, sleep loops, systemd timers, or by importing "
+    "cptr's Python code or writing to its database.\n"
+    "</cptr_tools>"
+)

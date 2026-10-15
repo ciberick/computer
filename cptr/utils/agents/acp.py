@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from contextlib import suppress
 from typing import Any, AsyncIterator
+
+from cptr.utils.agents.cptr_mcp import MCP_SERVER_NAME, CptrMcpSpec
 
 
 # How long to wait for the next event before re-checking whether the turn has ended. Matches the
@@ -41,6 +44,8 @@ class AcpClient:
         resume_session_id: str | None = None,
         auto_approve_permissions: bool = False,
         preexec_fn=None,
+        cptr_mcp: CptrMcpSpec | None = None,
+        approve_cptr_tools: bool = False,
     ) -> None:
         self.command = command
         self.args = args
@@ -51,6 +56,10 @@ class AcpClient:
         self.resume_session_id = resume_session_id
         self.auto_approve_permissions = auto_approve_permissions
         self.preexec_fn = preexec_fn
+        self.cptr_mcp = cptr_mcp
+        # cptr's own tools are pre-approved in auto/full like on Claude Code and Codex, even
+        # where the agent's other permission prompts are not.
+        self.approve_cptr_tools = approve_cptr_tools
         self.proc: asyncio.subprocess.Process | None = None
         self.reader_task: asyncio.Task | None = None
         self.stderr_task: asyncio.Task | None = None
@@ -169,18 +178,33 @@ class AcpClient:
                 "session/set_model", {"sessionId": self.session_id, "modelId": model}
             )
 
+    def _mcp_servers(self) -> list[dict[str, Any]]:
+        """cptr's MCP server, for agents that take MCP over HTTP (the rest get none yet)."""
+        if not self.cptr_mcp:
+            return []
+        capabilities = self.initialize_result.get("agentCapabilities")
+        mcp = capabilities.get("mcpCapabilities") if isinstance(capabilities, dict) else None
+        if not (isinstance(mcp, dict) and mcp.get("http")):
+            return []
+        return [self.cptr_mcp.acp_http_server()]
+
     async def _open_session(self) -> None:
         setup: dict[str, Any] | None = None
+        mcp_servers = self._mcp_servers()
         if self.resume_session_id:
             with suppress(Exception):
                 setup = await self.request(
                     "session/load",
-                    {"sessionId": self.resume_session_id, "cwd": self.cwd, "mcpServers": []},
+                    {
+                        "sessionId": self.resume_session_id,
+                        "cwd": self.cwd,
+                        "mcpServers": mcp_servers,
+                    },
                 )
                 self.session_id = self.resume_session_id
                 self._discard_replayed_history()
         if setup is None:
-            setup = await self.request("session/new", {"cwd": self.cwd, "mcpServers": []})
+            setup = await self.request("session/new", {"cwd": self.cwd, "mcpServers": mcp_servers})
             session_id = setup.get("sessionId")
             self.session_id = session_id if isinstance(session_id, str) else None
         if not self.session_id:
@@ -266,12 +290,31 @@ class AcpClient:
             option_id = _select_permission_option(
                 params, "allow_always"
             ) or _select_permission_option(params, "allow_once")
+        elif self.approve_cptr_tools and self._is_cptr_tool_permission(params):
+            option_id = _select_permission_option(params, "allow_once")
         outcome = (
             {"outcome": {"outcome": "selected", "optionId": option_id}}
             if option_id
             else {"outcome": {"outcome": "cancelled"}}
         )
         await self._send({"jsonrpc": "2.0", "id": request_id, "result": outcome})
+
+    def _is_cptr_tool_permission(self, params: dict[str, Any]) -> bool:
+        """A permission prompt for one of the cptr tools granted to this session.
+
+        Cursor titles an MCP call "<server>-<tool>: <tool>"; anything that runs a command or
+        touches files is never matched, whatever its title says.
+        """
+        if not self.cptr_mcp:
+            return False
+        tool_call = params.get("toolCall")
+        if not isinstance(tool_call, dict) or tool_call.get("kind") not in (None, "other", "fetch"):
+            return False
+        title = tool_call.get("title")
+        if not isinstance(title, str):
+            return False
+        match = re.fullmatch(rf"{re.escape(MCP_SERVER_NAME)}-([a-z_]+): \1", title.strip())
+        return bool(match) and match.group(1) in self.cptr_mcp.tools
 
 
 def _extract_json_message(buffer: bytes) -> tuple[dict[str, Any], bytes] | None:
