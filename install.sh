@@ -154,6 +154,12 @@ fi
 
 # --- Build ------------------------------------------------------------------------------------
 
+# The frontend goes first: the package force-includes cptr/frontend/build, so on a fresh clone
+# uv sync cannot build cptr until it exists.
+log "Building the frontend"
+as_svc npm --prefix "$DIR/cptr/frontend" ci
+as_svc npm --prefix "$DIR/cptr/frontend" run build
+
 log "Installing Python dependencies (extras: $EXTRAS)"
 extra_args=()
 IFS=',' read -ra extras <<<"$EXTRAS"
@@ -162,10 +168,6 @@ for extra in "${extras[@]}"; do
 done
 # --locked: install exactly what uv.lock pins, and never rewrite it (that would block the next update).
 as_svc uv sync --directory "$DIR" --locked "${extra_args[@]}"
-
-log "Building the frontend"
-as_svc npm --prefix "$DIR/cptr/frontend" ci
-as_svc npm --prefix "$DIR/cptr/frontend" run build
 
 # --- Service ----------------------------------------------------------------------------------
 
