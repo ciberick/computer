@@ -262,6 +262,9 @@ def _chat_approval_mode(chat_params: dict[str, Any]) -> str:
 def _sandbox_for_approval(value: str) -> str:
     if value == "ask":
         return "read-only"
+    if value == "full":
+        # Codex docs: full access is danger-full-access together with approval policy never.
+        return "danger-full-access"
     return "workspace-write"
 
 
