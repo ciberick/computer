@@ -249,6 +249,29 @@ if platform.system() == "Windows":
                     _normalize_obj(v)
 
 
+# Compress the JSON the phone reads over a VPN. Scoped by path rather than global: gateway, browser
+# and file downloads stream, and gzip would buffer or double-compress them. Added last so it wraps
+# every other middleware and compresses their final output.
+from starlette.middleware.gzip import GZipMiddleware
+
+_GZIP_PREFIXES = ("/api/chats", "/api/state", "/api/git/")
+
+
+class ScopedGZipMiddleware:
+    def __init__(self, app, minimum_size: int = 1024):
+        self.app = app
+        self.gzip = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith(_GZIP_PREFIXES):
+            await self.gzip(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
+
+
+app.add_middleware(ScopedGZipMiddleware)
+
+
 @app.get("/api/config")
 async def get_config():
     """Public config for the frontend."""

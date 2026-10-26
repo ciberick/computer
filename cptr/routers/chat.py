@@ -659,6 +659,10 @@ async def get_chat(
     chat_id: str,
     request: Request,
     model_id: str | None = Query(None, description="Model used for system prompt context"),
+    context: bool = Query(
+        True,
+        description="false skips context_usage, which rebuilds the history and system prompt",
+    ),
 ):
     """Get chat metadata + all messages."""
     user_id = _get_user(request)
@@ -667,7 +671,7 @@ async def get_chat(
         raise HTTPException(404, "chat not found")
 
     messages = await ChatMessage.get_all_by_chat(chat_id)
-    context_usage = await _get_chat_context_usage(request, chat, model_id)
+    context_usage = await _get_chat_context_usage(request, chat, model_id) if context else None
     from cptr.utils.chat_task import get_active_chat_ids
     from cptr.utils.tools import _normalize_tasks
 
