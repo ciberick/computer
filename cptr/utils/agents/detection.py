@@ -24,6 +24,10 @@ from cptr.utils.agents.models import (
 from cptr.utils.agents.opencode import opencode_server_url_candidates
 
 DETECTION_TTL_SECONDS = 30
+# Past the TTL the last answer is still served, and a refresh runs behind it: detection starts
+# every agent CLI (~3 s each), which made the model picker take 7-8 s to open on a phone whenever
+# it had been idle for 30 s. Only an answer older than this is waited for.
+DETECTION_MAX_STALE_SECONDS = 3600
 CLAUDE_MODEL_FALLBACKS = [
     "claude-fable-5",
     "claude-opus-4-8",
@@ -759,9 +763,35 @@ async def get_agent_status(app_state=None, refresh: bool = False) -> dict[str, A
     cache = getattr(app_state, "AGENTS", None) if app_state is not None else None
     if not refresh and isinstance(cache, dict):
         cached_at = cache.get("cached_at")
-        if isinstance(cached_at, (int, float)) and now - cached_at < DETECTION_TTL_SECONDS:
-            return cache["payload"]
+        if isinstance(cached_at, (int, float)):
+            age = now - cached_at
+            if age < DETECTION_TTL_SECONDS:
+                return cache["payload"]
+            if age < DETECTION_MAX_STALE_SECONDS:
+                _refresh_agent_status_in_background(app_state)
+                return cache["payload"]
 
+    return await _detect_agent_status(app_state, refresh)
+
+
+def _refresh_agent_status_in_background(app_state) -> None:
+    """Starts one refresh, however many requests found the cache stale at the same time."""
+    running = getattr(app_state, "AGENTS_REFRESH", None)
+    if running is not None and not running.done():
+        return
+
+    async def refresh() -> None:
+        try:
+            await _detect_agent_status(app_state, False)
+        except Exception:
+            # The stale answer keeps being served; the next request tries again.
+            pass
+
+    app_state.AGENTS_REFRESH = asyncio.get_running_loop().create_task(refresh())
+
+
+async def _detect_agent_status(app_state, refresh: bool) -> dict[str, Any]:
+    now = asyncio.get_running_loop().time()
     raw_profiles = await get_raw_agent_profiles()
     implicit_defaults = raw_profiles is None
     profiles = [] if implicit_defaults else normalize_agent_profiles(raw_profiles)
