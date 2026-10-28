@@ -18,7 +18,9 @@
 #   CPTR_USER     user that runs the server        (default: you; under sudo, the user who ran it)
 #   CPTR_DIR      where the repo lives             (default: ~CPTR_USER/computer)
 #   CPTR_BRANCH   branch to install                (default: deploy)
-#   CPTR_HOST     address to bind                  (default: 0.0.0.0)
+#   CPTR_HOST     address to bind                  (default: this machine's Tailscale address if it
+#                                                   has one, so the server is not open to the LAN;
+#                                                   otherwise 0.0.0.0)
 #   CPTR_PORT     port to bind                     (default: 8000)
 #   CPTR_EXTRAS   optional extras, comma-separated (default: agents)
 #   CPTR_PATH     PATH the server sees, where it finds claude, codex, uv... (default: your PATH)
@@ -38,10 +40,25 @@ unit_get() { [ -f "$UNIT" ] && sed -n "s/^$1=//p" "$UNIT" | head -n1 || true; }
 unit_env() { [ -f "$UNIT" ] && sed -n "s/^Environment=\"$1=\(.*\)\"$/\1/p" "$UNIT" | head -n1 || true; }
 unit_arg() { [ -f "$UNIT" ] && sed -n "s/^ExecStart=.* --$1 \([^ ]*\).*/\1/p" "$UNIT" | head -n1 || true; }
 
+# The IPv4 address of the Tailscale interface, or nothing if there is none.
+tailscale_ip() {
+	local ip=""
+	if command -v tailscale >/dev/null 2>&1; then
+		ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+	fi
+	if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
+		ip="$(ip -4 -o addr show dev tailscale0 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p' | head -n1 || true)"
+	fi
+	case "$ip" in *[!0-9.]* | "") ip="" ;; esac
+	printf '%s' "$ip"
+}
+
+# wait_healthy PORT [HOST]: HOST is where the server is bound; 0.0.0.0 is reached through loopback.
 wait_healthy() {
-	local port="$1"
+	local port="$1" host="${2:-127.0.0.1}"
+	[ "$host" != 0.0.0.0 ] || host=127.0.0.1
 	for _ in $(seq 60); do
-		curl -fsS -o /dev/null "http://127.0.0.1:$port/api/health" 2>/dev/null && return 0
+		curl -fsS -o /dev/null "http://$host:$port/api/health" 2>/dev/null && return 0
 		# "activating" covers the pause before Restart=on-failure tries again.
 		case "$(systemctl show -p ActiveState --value "$SERVICE")" in failed | inactive) break ;; esac
 		sleep 0.5
@@ -57,7 +74,7 @@ case "$cmd" in
 start | stop | restart)
 	[ -f "$UNIT" ] || die "the $SERVICE service is not installed; run: $0 install"
 	as_root systemctl "$cmd" "$SERVICE"
-	[ "$cmd" = stop ] || wait_healthy "$(unit_arg port)"
+	[ "$cmd" = stop ] || wait_healthy "$(unit_arg port)" "$(unit_arg host)"
 	systemctl status "$SERVICE" --no-pager --lines=0 || true
 	exit 0
 	;;
@@ -86,6 +103,15 @@ DIR="${CPTR_DIR:-$(unit_get WorkingDirectory)}"
 DIR="${DIR:-$SVC_HOME/computer}"
 BRANCH="${CPTR_BRANCH:-deploy}"
 HOST="${CPTR_HOST:-$(unit_arg host)}"
+# Bound to the Tailscale address the server is only reachable over the tailnet. An address set on
+# purpose (CPTR_HOST, or a unit edited to something other than 0.0.0.0) is never replaced.
+if [ -z "$HOST" ] || [ "$HOST" = 0.0.0.0 ]; then
+	TS_IP="$(tailscale_ip)"
+	if [ -n "$TS_IP" ]; then
+		HOST="$TS_IP"
+		log "Tailscale found: binding to $HOST instead of 0.0.0.0"
+	fi
+fi
 HOST="${HOST:-0.0.0.0}"
 PORT="${CPTR_PORT:-$(unit_arg port)}"
 PORT="${PORT:-8000}"
@@ -199,7 +225,7 @@ log "Writing $UNIT"
 	cat <<EOF
 [Unit]
 Description=cptr (ciberick/computer, $BRANCH)
-After=network-online.target
+After=network-online.target tailscaled.service
 Wants=network-online.target
 
 [Service]
@@ -224,7 +250,7 @@ as_root systemctl daemon-reload
 as_root systemctl enable --quiet "$SERVICE"
 log "Restarting $SERVICE"
 as_root systemctl restart "$SERVICE"
-wait_healthy "$PORT"
+wait_healthy "$PORT" "$HOST"
 
 version="$(as_svc "$DIR/.venv/bin/python" -c 'from importlib.metadata import version; print(version("cptr"))')"
 log "cptr $version is up on port $PORT ($(as_svc git -C "$DIR" rev-parse --short HEAD))"

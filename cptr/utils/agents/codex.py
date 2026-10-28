@@ -423,6 +423,9 @@ async def run_codex_agent(
     cptr_mcp: CptrMcpSpec | None = None,
 ) -> AsyncIterator[AgentEvent]:
     env = env_for(identity, workspace) if identity and identity.is_pam else os.environ.copy()
+    # Codex reports this as the client in its usage statistics. Only Codex gets it: other agents
+    # would rather not be told they are driven by OpenClaw.
+    env["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = "openclaw"
     if profile.get("home"):
         env["CODEX_HOME"] = os.path.expanduser(str(profile["home"]))
     config_args: list[str] = []
