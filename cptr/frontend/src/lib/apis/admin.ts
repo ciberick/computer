@@ -102,6 +102,8 @@ export interface AgentsResponseProfile {
 		message: string | null;
 		models?: string[] | null;
 	};
+	/** The agent's bare version (`2.1.314`); `detected.version` is the CLI's own line. */
+	version?: string | null;
 	available: boolean;
 	implicit: boolean;
 	model_ids: string[];

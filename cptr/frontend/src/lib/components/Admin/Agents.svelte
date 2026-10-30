@@ -25,6 +25,7 @@
 	let profiles = $state<AgentProfile[]>([]);
 	let detected = $state<Record<string, AgentsResponseProfile['detected']>>({});
 	let available = $state<Record<string, boolean>>({});
+	let versions = $state<Record<string, string | null>>({});
 	let saved = $state<Record<string, boolean>>({});
 	let modal = $state<ModalState | null>(null);
 	let deletedProfile = $state(false);
@@ -62,6 +63,7 @@
 		profiles = data.profiles.map((entry) => entry.config);
 		detected = Object.fromEntries(data.profiles.map((entry) => [entry.id, entry.detected]));
 		available = Object.fromEntries(data.profiles.map((entry) => [entry.id, entry.available]));
+		versions = Object.fromEntries(data.profiles.map((entry) => [entry.id, entry.version ?? null]));
 		saved = Object.fromEntries(data.profiles.map((entry) => [entry.id, !entry.implicit]));
 		deletedProfile = false;
 	}
@@ -102,6 +104,12 @@
 					? profile.default_model
 					: `${modelCount} models`;
 		return `agent:${profile.id} · ${modelLabel}`;
+	}
+
+	function versionLabel(profile: AgentProfile): string {
+		const version = versions[profile.id];
+		if (!version) return '';
+		return /^\d/.test(version) ? `v${version}` : version;
 	}
 
 	function defaultProfileId(agent: AgentProfile['agent']): string {
@@ -280,6 +288,11 @@
 								: 'text-gray-700 dark:text-gray-300'}"
 						>
 							{profile.name}
+							{#if versionLabel(profile)}
+								<span class="ml-1 text-[0.6875rem] text-gray-400 dark:text-gray-600">
+									{versionLabel(profile)}
+								</span>
+							{/if}
 						</span>
 						<span class="block text-[0.6875rem] text-gray-400 dark:text-gray-600 truncate">
 							{profileSubtitle(profile)}

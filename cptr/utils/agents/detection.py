@@ -29,6 +29,10 @@ DETECTION_TTL_SECONDS = 30
 # it had been idle for 30 s. Only an answer older than this is waited for.
 DETECTION_MAX_STALE_SECONDS = 3600
 CLAUDE_MODEL_FALLBACKS = [
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
     "claude-fable-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
@@ -37,6 +41,15 @@ CLAUDE_MODEL_FALLBACKS = [
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
 ]
+# The 5.x ids are listed by CLI 2.1.314; the first release that knows them was not looked up, so
+# this is a safe floor rather than the exact one. The CLI's own list replaces these anyway.
+MIN_CLAUDE_5_5 = (2, 1, 300)
+CLAUDE_5_5_MODELS = {
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+}
 MIN_CLAUDE_FABLE_5 = (2, 1, 169)
 MIN_CLAUDE_OPUS_4_8 = (2, 1, 154)
 MIN_CLAUDE_OPUS_4_7 = (2, 1, 111)
@@ -434,6 +447,17 @@ def _parse_version_tuple(version: str | None) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups())
 
 
+_DISPLAY_VERSION_RE = re.compile(r"\d+(?:\.\d+)+(?:[-+][0-9A-Za-z.]+)?")
+
+
+def display_agent_version(raw: str | None) -> str | None:
+    """The bare version out of what an agent CLI prints: `2.1.314 (Claude Code)` -> `2.1.314`."""
+    if not raw or not raw.strip():
+        return None
+    match = _DISPLAY_VERSION_RE.search(raw)
+    return match.group(0) if match else raw.strip()
+
+
 def _version_at_least(version: tuple[int, int, int] | None, minimum: tuple[int, int, int]) -> bool:
     return version is not None and version >= minimum
 
@@ -442,6 +466,8 @@ def _claude_models_for_version(version: str | None) -> list[str]:
     parsed = _parse_version_tuple(version)
     models = []
     for model in CLAUDE_MODEL_FALLBACKS:
+        if model in CLAUDE_5_5_MODELS and not _version_at_least(parsed, MIN_CLAUDE_5_5):
+            continue
         if model == "claude-fable-5" and not _version_at_least(parsed, MIN_CLAUDE_FABLE_5):
             continue
         if model == "claude-opus-4-8" and not _version_at_least(parsed, MIN_CLAUDE_OPUS_4_8):
@@ -822,6 +848,8 @@ async def _detect_agent_status(app_state, refresh: bool) -> dict[str, Any]:
                 "name": effective_profile["name"],
                 "config": effective_profile,
                 "detected": detected.to_dict(),
+                # `detected.version` is the CLI's own line; this is the bare number for display.
+                "version": display_agent_version(detected.version),
                 "available": available,
                 "implicit": implicit_defaults,
                 "model_ids": [model_id_for_profile(effective_profile, model) for model in models],
@@ -848,6 +876,7 @@ async def get_available_agent_model_entries(app_state=None) -> list[dict[str, An
             continue
         config = profile["config"]
         details = (profile.get("detected") or {}).get("model_details") or {}
+        version = profile.get("version")
         for model in config.get("models") or []:
             model_id = model_id_for_profile(config, model)
             entry: dict[str, Any] = {
@@ -860,6 +889,8 @@ async def get_available_agent_model_entries(app_state=None) -> list[dict[str, An
             }
             # Extra keys only when the agent reported them, so clients that read only the
             # original six see exactly what they saw before.
+            if version:
+                entry["agent_version"] = version
             entry.update(details.get(model) or {})
             entries.append(entry)
     return entries
