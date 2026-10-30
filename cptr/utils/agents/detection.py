@@ -348,11 +348,13 @@ async def detect_profile(profile: dict[str, Any], refresh: bool = False) -> Agen
 
     if profile.get("agent") == "cursor":
         about = await _probe_cursor_about(command, profile)
+        # `about` can fail to yield a version (an older CLI, odd output) while `--version` works.
+        cursor_version = about.get("version") or version
         if about["status"] != "ready":
             return AgentDetection(
                 about["status"],
                 command,
-                about.get("version"),
+                cursor_version,
                 about.get("message"),
                 [],
             )
@@ -361,11 +363,11 @@ async def detect_profile(profile: dict[str, Any], refresh: bool = False) -> Agen
             return AgentDetection(
                 "auth_unknown",
                 command,
-                about.get("version"),
+                cursor_version,
                 "Could not discover Cursor models. Check Cursor Agent login and CLI setup.",
                 [],
             )
-        return AgentDetection("ready", command, about.get("version"), None, models)
+        return AgentDetection("ready", command, cursor_version, None, models)
 
     if profile.get("agent") == "grok":
         models = await _probe_grok_models(command, profile)
@@ -548,7 +550,9 @@ async def _probe_cursor_about(command: str, profile: dict[str, Any]) -> dict[str
     version = None
     if text:
         with suppress(Exception):
-            parsed = json.loads(text)
+            # The braces, not the whole output: a notice printed around the JSON (an update
+            # banner) would otherwise cost the version.
+            parsed = json.loads(text[text.index("{") : text.rindex("}") + 1])
             if isinstance(parsed, dict):
                 raw_version = parsed.get("cliVersion")
                 version = raw_version.strip() if isinstance(raw_version, str) else None
