@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import json
+import logging
 import os
 import re
 from collections import deque
@@ -31,6 +32,8 @@ CODEX_MAX_WIRE_MESSAGE_CHARS = 16 * 1024 * 1024
 # (`willRetry: false`); its own retries cover only dropped connections and streams. These are the
 # waits before the turns cptr starts again, one per retry.
 CODEX_OVERLOAD_RETRY_DELAYS = (5.0, 15.0, 45.0)
+
+logger = logging.getLogger(__name__)
 
 
 class CodexAppServer:
@@ -509,6 +512,7 @@ async def run_codex_agent(
                 }
             )
         overload_retries = 0
+        reconnect_notices = 0
         while True:
             turn_response = await client.request(
                 "turn/start",
@@ -568,6 +572,12 @@ async def run_codex_agent(
                         error = completed_turn.get("error")
                         yield AgentError(_codex_error_message(error) or f"Codex turn {status}")
                         return
+                    if overload_retries:
+                        logger.info(
+                            "Codex capacity error cleared after %d retr%s",
+                            overload_retries,
+                            "y" if overload_retries == 1 else "ies",
+                        )
                     yield AgentDone(
                         resume_state={
                             "profile_id": profile["id"],
@@ -585,8 +595,12 @@ async def run_codex_agent(
                         # Codex is retrying this itself ("Reconnecting... 2/5"): the turn is
                         # still alive, so only show where it is and keep waiting.
                         title = (message or "Codex is reconnecting").splitlines()[0][:200]
+                        if reconnecting is None:
+                            # One row per episode, so a second one later in the message does not
+                            # pull the first one's row back into progress.
+                            reconnect_notices += 1
                         reconnecting = AgentToolUpdate(
-                            call_id="codex-reconnecting",
+                            call_id=f"codex-reconnecting-{reconnect_notices}",
                             name="agent_tool",
                             status="in_progress",
                             arguments={"title": title},
@@ -602,13 +616,18 @@ async def run_codex_agent(
                         # nothing shown or run yet, a new turn repeats nothing.
                         delay = CODEX_OVERLOAD_RETRY_DELAYS[overload_retries]
                         overload_retries += 1
+                        total = len(CODEX_OVERLOAD_RETRY_DELAYS)
+                        logger.info(
+                            "Codex at capacity: retry %d/%d in %gs", overload_retries, total, delay
+                        )
                         notice = AgentToolUpdate(
                             call_id=f"codex-capacity-{overload_retries}",
                             name="agent_tool",
                             status="in_progress",
+                            # Short on purpose: the phone app shows a row on one line.
                             arguments={
-                                "title": "Codex model at capacity, retrying in "
-                                f"{delay:g}s ({overload_retries}/{len(CODEX_OVERLOAD_RETRY_DELAYS)})"
+                                "title": f"Codex at capacity, retry {overload_retries}/{total} "
+                                f"in {delay:g}s"
                             },
                         )
                         yield notice
@@ -620,6 +639,13 @@ async def run_codex_agent(
                             arguments=notice.arguments,
                         )
                         break
+                    if _codex_error_info(error) == "serverOverloaded":
+                        logger.warning(
+                            "Codex at capacity: giving up after %d retr%s%s",
+                            overload_retries,
+                            "y" if overload_retries == 1 else "ies",
+                            " (output already shown)" if progressed else "",
+                        )
                     yield AgentError(message or str(params or "Codex app-server error"))
                     return
                 elif method == "process/exited":
