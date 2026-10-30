@@ -27,6 +27,10 @@ from cptr.utils.identity import env_for, preexec_for
 
 CODEX_STDOUT_CHUNK_SIZE = 64 * 1024
 CODEX_MAX_WIRE_MESSAGE_CHARS = 16 * 1024 * 1024
+# Codex ends a turn on `serverOverloaded` ("Selected model is at capacity") and does not retry it
+# (`willRetry: false`); its own retries cover only dropped connections and streams. These are the
+# waits before the turns cptr starts again, one per retry.
+CODEX_OVERLOAD_RETRY_DELAYS = (5.0, 15.0, 45.0)
 
 
 class CodexAppServer:
@@ -279,6 +283,35 @@ def _codex_turn_options(chat_params: dict[str, Any]) -> dict[str, str]:
     return options
 
 
+def _event_turn_id(params: dict[str, Any]) -> str | None:
+    """The turn a notification belongs to: `turnId`, or `turn.id` on `turn/started|completed`."""
+    value = params.get("turnId")
+    if not value and isinstance(params.get("turn"), dict):
+        value = params["turn"].get("id")
+    return value if isinstance(value, str) and value else None
+
+
+def _codex_error_info(error: Any) -> str | None:
+    """`codexErrorInfo` as its name: a plain string, or the one key of an object variant."""
+    info = error.get("codexErrorInfo") if isinstance(error, dict) else None
+    if isinstance(info, str):
+        return info
+    if isinstance(info, dict) and info:
+        return str(next(iter(info)))
+    return None
+
+
+def _codex_error_message(error: Any) -> str | None:
+    """Words for a Codex `TurnError`, not the raw payload."""
+    if not isinstance(error, dict):
+        return None
+    message = str(error.get("message") or "").strip()
+    details = str(error.get("additionalDetails") or "").strip()
+    if message and details and details not in message:
+        return f"{message}\n{details}"
+    return message or details or None
+
+
 def _resume_thread_id(resume_state: dict[str, Any] | None) -> str | None:
     if not resume_state:
         return None
@@ -475,64 +508,130 @@ async def run_codex_agent(
                     "url": f"data:{image.mime_type};base64,{image.base64}",
                 }
             )
-        turn_response = await client.request(
-            "turn/start",
-            {
-                "threadId": thread_id,
-                "input": turn_input,
-                **_codex_turn_options(chat_params),
-            },
-        )
-        turn = turn_response.get("result", {}).get("turn", {})
-        turn_id = turn.get("id") if isinstance(turn, dict) else None
-
+        overload_retries = 0
         while True:
-            event = await client.events.get()
-            method = event.get("method")
-            params = event.get("params") if isinstance(event.get("params"), dict) else {}
-            event_turn_id = params.get("turnId")
-            if event_turn_id and turn_id and event_turn_id != turn_id:
-                continue
-            if method == "item/agentMessage/delta":
-                delta = params.get("delta")
-                if isinstance(delta, str) and delta:
-                    yield AgentTextDelta(delta)
-            elif method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
-                delta = params.get("delta")
-                if isinstance(delta, str) and delta:
-                    yield AgentReasoningDelta(delta)
-            else:
-                tool_output = _tool_output_from_event(str(method or ""), params)
-                if tool_output:
-                    yield tool_output
+            turn_response = await client.request(
+                "turn/start",
+                {
+                    "threadId": thread_id,
+                    "input": turn_input,
+                    **_codex_turn_options(chat_params),
+                },
+            )
+            turn = turn_response.get("result", {}).get("turn", {})
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            # Text or tool activity already shown for this turn: running it again would repeat it.
+            progressed = False
+            # The notice of a retry Codex is making on its own, shown until the turn moves on.
+            reconnecting: AgentToolUpdate | None = None
+
+            while True:
+                event = await client.events.get()
+                method = event.get("method")
+                params = event.get("params") if isinstance(event.get("params"), dict) else {}
+                event_turn_id = _event_turn_id(params)
+                if event_turn_id and turn_id and event_turn_id != turn_id:
+                    continue
+                if reconnecting and method != "error":
+                    yield AgentToolUpdate(
+                        call_id=reconnecting.call_id,
+                        name=reconnecting.name,
+                        status="completed",
+                        arguments=reconnecting.arguments,
+                    )
+                    reconnecting = None
+                if method == "item/agentMessage/delta":
+                    delta = params.get("delta")
+                    if isinstance(delta, str) and delta:
+                        progressed = True
+                        yield AgentTextDelta(delta)
+                elif method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
+                    delta = params.get("delta")
+                    if isinstance(delta, str) and delta:
+                        yield AgentReasoningDelta(delta)
                 else:
-                    tool = _tool_from_item_event(str(method or ""), params)
-                    if tool:
-                        yield tool
-            if method == "turn/completed":
-                yield AgentDone(
-                    resume_state={
-                        "profile_id": profile["id"],
-                        "thread_id": thread_id,
-                        "turn_id": turn_id,
-                        "workspace": workspace,
-                        "model": model,
-                    }
-                )
-                return
-            elif method == "turn/failed":
-                detail = params.get("message") or params.get("error") or "Codex turn failed"
-                yield AgentError(str(detail))
-                return
-            elif method == "error":
-                yield AgentError(str(params or "Codex app-server error"))
-                return
-            elif method == "process/exited":
-                yield AgentError(str(params.get("message") or "Codex app-server exited."))
-                return
-            elif method == "transport/error":
-                yield AgentError(str(params.get("message") or "Codex app-server transport error"))
-                return
+                    tool_output = _tool_output_from_event(str(method or ""), params)
+                    if tool_output:
+                        progressed = True
+                        yield tool_output
+                    else:
+                        tool = _tool_from_item_event(str(method or ""), params)
+                        if tool:
+                            progressed = True
+                            yield tool
+                if method == "turn/completed":
+                    completed_turn = params.get("turn")
+                    status = (
+                        completed_turn.get("status") if isinstance(completed_turn, dict) else None
+                    )
+                    if status in ("failed", "interrupted"):
+                        error = completed_turn.get("error")
+                        yield AgentError(_codex_error_message(error) or f"Codex turn {status}")
+                        return
+                    yield AgentDone(
+                        resume_state={
+                            "profile_id": profile["id"],
+                            "thread_id": thread_id,
+                            "turn_id": turn_id,
+                            "workspace": workspace,
+                            "model": model,
+                        }
+                    )
+                    return
+                elif method == "error":
+                    error = params.get("error")
+                    message = _codex_error_message(error)
+                    if params.get("willRetry"):
+                        # Codex is retrying this itself ("Reconnecting... 2/5"): the turn is
+                        # still alive, so only show where it is and keep waiting.
+                        title = (message or "Codex is reconnecting").splitlines()[0][:200]
+                        reconnecting = AgentToolUpdate(
+                            call_id="codex-reconnecting",
+                            name="agent_tool",
+                            status="in_progress",
+                            arguments={"title": title},
+                        )
+                        yield reconnecting
+                        continue
+                    if (
+                        _codex_error_info(error) == "serverOverloaded"
+                        and not progressed
+                        and overload_retries < len(CODEX_OVERLOAD_RETRY_DELAYS)
+                    ):
+                        # Codex ends the turn on a capacity error and does not retry it. With
+                        # nothing shown or run yet, a new turn repeats nothing.
+                        delay = CODEX_OVERLOAD_RETRY_DELAYS[overload_retries]
+                        overload_retries += 1
+                        notice = AgentToolUpdate(
+                            call_id=f"codex-capacity-{overload_retries}",
+                            name="agent_tool",
+                            status="in_progress",
+                            arguments={
+                                "title": "Codex model at capacity, retrying in "
+                                f"{delay:g}s ({overload_retries}/{len(CODEX_OVERLOAD_RETRY_DELAYS)})"
+                            },
+                        )
+                        yield notice
+                        await asyncio.sleep(delay)
+                        yield AgentToolUpdate(
+                            call_id=notice.call_id,
+                            name=notice.name,
+                            status="completed",
+                            arguments=notice.arguments,
+                        )
+                        break
+                    yield AgentError(message or str(params or "Codex app-server error"))
+                    return
+                elif method == "process/exited":
+                    yield AgentError(str(params.get("message") or "Codex app-server exited."))
+                    return
+                elif method == "transport/error":
+                    yield AgentError(
+                        str(params.get("message") or "Codex app-server transport error")
+                    )
+                    return
+            # Only a capacity retry leaves the loop above (every other end returns), so the next
+            # pass starts the turn again.
     except asyncio.CancelledError:
         if thread_id and turn_id:
             with suppress(Exception):
