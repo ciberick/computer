@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import importlib.util
 import json
 import os
@@ -23,11 +24,13 @@ from cptr.utils.agents.models import (
 )
 from cptr.utils.agents.opencode import opencode_server_url_candidates
 
+logger = logging.getLogger(__name__)
+
 DETECTION_TTL_SECONDS = 30
 # Past the TTL the last answer is still served, and a refresh runs behind it: detection starts
 # every agent CLI (~3 s each), which made the model picker take 7-8 s to open on a phone whenever
-# it had been idle for 30 s. Only an answer older than this is waited for.
-DETECTION_MAX_STALE_SECONDS = 3600
+# it had been idle for 30 s. Only an answer older than this, or none at all, is waited for.
+DETECTION_MAX_STALE_SECONDS = 7 * 24 * 3600
 CLAUDE_MODEL_FALLBACKS = [
     "claude-fable-5-1",
     "claude-opus-5-5",
@@ -343,7 +346,18 @@ async def detect_profile(profile: dict[str, Any], refresh: bool = False) -> Agen
                 version,
                 help_text or "codex app-server is unavailable",
             )
-        models = await _probe_codex_models(command, profile)
+        models = await _probe_codex_models(command, profile, version)
+        if not models and not profile.get("models"):
+            # Ready with no models is invisible: the picker lists nothing for it and Settings says
+            # nothing is wrong. Say what happened instead; the next detection asks again.
+            return AgentDetection(
+                "auth_unknown",
+                command,
+                version,
+                "Could not list Codex models (the app-server did not answer in time or refused). "
+                "Check `codex login` and the server log.",
+                [],
+            )
         return AgentDetection("ready", command, version, None, models)
 
     if profile.get("agent") == "cursor":
@@ -480,22 +494,32 @@ def _claude_models_for_version(version: str | None) -> list[str]:
     return models
 
 
-async def _probe_codex_models(command: str, profile: dict[str, Any]) -> list[str] | None:
+# The last model list Codex gave, by (command, home, version). Asking costs an app-server start;
+# on a busy host that start can outlast the timeout, and a probe that came back empty used to drop
+# Codex from the picker until the next detection happened to be luckier.
+_codex_models_cache: dict[tuple[str, str | None, str | None], list[str]] = {}
+CODEX_PROBE_TIMEOUT_SECONDS = 12
+
+
+async def _probe_codex_models(
+    command: str, profile: dict[str, Any], version: str | None = None
+) -> list[str] | None:
     from cptr.utils.agents.codex import CodexAppServer
 
     env = os.environ.copy()
     if profile.get("home"):
         env["CODEX_HOME"] = os.path.expanduser(str(profile["home"]))
+    key = (command, str(profile.get("home") or "") or None, version)
 
     client = CodexAppServer(command, os.getcwd(), env)
     try:
-        await asyncio.wait_for(client.start(), timeout=5)
+        await asyncio.wait_for(client.start(), timeout=CODEX_PROBE_TIMEOUT_SECONDS)
         models: list[str] = []
         cursor: str | None = None
         while True:
             response = await asyncio.wait_for(
                 client.request("model/list", {"cursor": cursor} if cursor else {}),
-                timeout=5,
+                timeout=CODEX_PROBE_TIMEOUT_SECONDS,
             )
             result = response.get("result") if isinstance(response.get("result"), dict) else {}
             data = result.get("data") if isinstance(result, dict) else None
@@ -508,11 +532,20 @@ async def _probe_codex_models(command: str, profile: dict[str, Any]) -> list[str
             cursor = next_cursor if isinstance(next_cursor, str) and next_cursor else None
             if not cursor:
                 break
-        return models or None
-    except Exception:
-        return None
+        if models:
+            _codex_models_cache[key] = models
+            return models
+        logger.warning("Codex model/list returned no models; using the last list if there is one")
+    except Exception as exc:  # noqa: BLE001 - detection reports it as a status.
+        logger.warning(
+            "Codex model probe failed (%s): %r; stderr: %s",
+            type(exc).__name__,
+            exc,
+            " | ".join(client.stderr_tail) or "-",
+        )
     finally:
         await client.close()
+    return _codex_models_cache.get(key)
 
 
 async def _probe_pi_models(command: str, profile: dict[str, Any]) -> list[str] | None:
